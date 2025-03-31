@@ -19,7 +19,7 @@ The Liquidity Mining Auction implements a recurring Dutch auction system with in
 1. **Auction Token - PNDC**
    - Used for bidding
    - Transferred from winner to contract upon successful bid
-   - Later, transferred to mining deposit address to be warpped and mined on Solana
+   - Later, transferred to mining deposit address to be Warped and mined on Solana
 
 2. **Fee Token**
    - Token used for fee distribution
