@@ -23,6 +23,9 @@ contract LiquidityMiningAuction {
     // 1 trillion PNDC minimum to participate. PNDC has 18 decimals, so
     // 1e12 tokens * 1e18 = 1e30 raw. (`ether` == 1e18.)
     uint256 public constant MIN_BID = 1_000_000_000_000 ether;
+    // Deposits round down to whole billions of PNDC — no odd fractional amounts.
+    // 1e9 tokens * 1e18 = 1e27 raw.
+    uint256 public constant ONE_BILLION = 1_000_000_000 ether;
 
     struct Auction {
         uint256 startAt;
@@ -116,6 +119,8 @@ contract LiquidityMiningAuction {
     /// @notice Deposit PNDC into the current auction (tops up an existing position).
     ///         Total position must reach the 1T minimum to be active.
     function deposit(uint256 amount) external notPaused nonReentrant {
+        // round down to whole billions — no odd fractional deposits
+        amount = amount - (amount % ONE_BILLION);
         require(amount > 0, "amount zero");
         uint256 id = currentAuctionId;
         Auction storage a = auctions[id];

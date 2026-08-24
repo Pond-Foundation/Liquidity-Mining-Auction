@@ -228,23 +228,43 @@ contract AuctionTest is Test {
 
     /* ---------------------------------------------------------- fuzz */
 
+    function test_depositRoundsDownToNearestBillion() public {
+        uint256 oneBil = auction.ONE_BILLION();
+        uint256 requested = ONE_T + oneBil + oneBil / 2; // extra half-billion is dropped
+        uint256 expected = ONE_T + oneBil;
+        uint256 before = pndc.balanceOf(alice);
+
+        vm.prank(alice);
+        auction.deposit(requested);
+
+        assertEq(auction.getPosition(1, alice), expected);
+        assertEq(pndc.balanceOf(alice), before - expected); // dust never pulled
+        assertEq(pndc.balanceOf(address(auction)), expected);
+    }
+
     function testFuzz_depositMinimumBoundary(uint256 amt) public {
+        uint256 oneBil = auction.ONE_BILLION();
         amt = bound(amt, 1, 1e34);
+        uint256 rounded = amt - (amt % oneBil);
         pndc.mint(alice, amt);
         vm.startPrank(alice);
         pndc.approve(address(auction), type(uint256).max);
-        if (amt < ONE_T) {
+        if (rounded == 0) {
+            vm.expectRevert("amount zero");
+            auction.deposit(amt);
+        } else if (rounded < ONE_T) {
             vm.expectRevert("below 1T minimum");
             auction.deposit(amt);
         } else {
             auction.deposit(amt);
-            assertEq(auction.getPosition(1, alice), amt);
+            assertEq(auction.getPosition(1, alice), rounded);
         }
         vm.stopPrank();
     }
 
     function testFuzz_exitRefundsExact(uint256 amt) public {
         amt = bound(amt, ONE_T, 5 * ONE_T);
+        amt = amt - (amt % auction.ONE_BILLION()); // whole billions
         _deposit(alice, amt);
         uint256 before = pndc.balanceOf(alice);
         vm.prank(alice);

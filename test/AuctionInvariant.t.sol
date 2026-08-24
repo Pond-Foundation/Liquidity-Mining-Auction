@@ -6,6 +6,7 @@ import {LiquidityMiningAuction} from "../contracts/LiquidityMiningAuction.sol";
 import {MockERC20} from "../contracts/mocks/MockERC20.sol";
 
 uint256 constant ONE_T = 1_000_000_000_000 ether;
+uint256 constant ONE_BILLION = 1_000_000_000 ether;
 
 /// Bounded actor that drives the auction through random deposit/exit/finalize/warp
 /// sequences while tracking the total PNDC it believes is escrowed.
@@ -31,6 +32,8 @@ contract Handler is Test {
         uint256 cur = auction.getPosition(id, who);
         uint256 lo = cur >= ONE_T ? 1 : (ONE_T - cur);
         uint256 amt = bound(amtSeed, lo, 3 * ONE_T);
+        amt = amt - (amt % ONE_BILLION); // mirror the contract's whole-billion rounding
+        if (amt == 0) return;
 
         pndc.mint(who, amt);
         vm.startPrank(who);
