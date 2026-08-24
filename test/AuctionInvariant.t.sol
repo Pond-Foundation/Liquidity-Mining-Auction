@@ -71,7 +71,8 @@ contract AuctionInvariantTest is Test {
 
     function setUp() public {
         pndc = new MockERC20("Pond Coin", "PNDC");
-        auction = new LiquidityMiningAuction(address(pndc), makeAddr("warp"));
+        MockERC20 feeTok = new MockERC20("Fee Reward", "FEE");
+        auction = new LiquidityMiningAuction(address(pndc), address(feeTok), makeAddr("warp"));
         handler = new Handler(auction, pndc);
         targetContract(address(handler));
     }

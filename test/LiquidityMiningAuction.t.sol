@@ -9,6 +9,7 @@ import {ReentrantToken, IAuction} from "../contracts/mocks/ReentrantToken.sol";
 contract AuctionTest is Test {
     LiquidityMiningAuction internal auction;
     MockERC20 internal pndc;
+    MockERC20 internal fee;
 
     address internal warp = makeAddr("warp");
     address internal alice = makeAddr("alice");
@@ -24,7 +25,8 @@ contract AuctionTest is Test {
 
     function setUp() public {
         pndc = new MockERC20("Pond Coin", "PNDC");
-        auction = new LiquidityMiningAuction(address(pndc), warp);
+        fee = new MockERC20("Fee Reward", "FEE");
+        auction = new LiquidityMiningAuction(address(pndc), address(fee), warp);
         _fund(alice, 5 * ONE_T);
         _fund(bob, 5 * ONE_T);
         _fund(carol, 5 * ONE_T);
@@ -143,6 +145,41 @@ contract AuctionTest is Test {
         auction.sendToWarp(1);
     }
 
+    function test_feeRewardShare_winnerClaims() public {
+        _deposit(alice, ONE_T);
+        _deposit(bob, 3 * ONE_T); // winner
+        vm.warp(block.timestamp + DURATION + 1);
+        auction.finalize();
+
+        // POW-mining fees accrue into the auction's vault
+        uint256 feeAmt = 5 ether;
+        fee.mint(address(this), feeAmt);
+        fee.approve(address(auction), feeAmt);
+        auction.depositFee(1, feeAmt);
+        assertEq(auction.getFeeVault(1).amount, feeAmt);
+
+        vm.prank(alice); // loser
+        vm.expectRevert("only winner");
+        auction.claimFee(1);
+
+        uint256 before = fee.balanceOf(bob);
+        vm.prank(bob);
+        auction.claimFee(1);
+        assertEq(fee.balanceOf(bob), before + feeAmt);
+
+        vm.prank(bob);
+        vm.expectRevert("already claimed");
+        auction.claimFee(1);
+    }
+
+    function test_depositFeeRequiresFinalized() public {
+        _deposit(alice, ONE_T);
+        fee.mint(address(this), 1 ether);
+        fee.approve(address(auction), 1 ether);
+        vm.expectRevert("not finalized");
+        auction.depositFee(1, 1 ether);
+    }
+
     function test_finalizeBeforeExpiryReverts() public {
         _deposit(alice, ONE_T);
         vm.expectRevert("not ended");
@@ -175,7 +212,7 @@ contract AuctionTest is Test {
 
     function test_reentrancyGuardBlocksExitReenter() public {
         ReentrantToken evil = new ReentrantToken();
-        LiquidityMiningAuction a2 = new LiquidityMiningAuction(address(evil), warp);
+        LiquidityMiningAuction a2 = new LiquidityMiningAuction(address(evil), address(fee), warp);
         evil.mint(alice, 3 * ONE_T);
         vm.prank(alice);
         evil.approve(address(a2), type(uint256).max);

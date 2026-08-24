@@ -39,7 +39,15 @@ contract LiquidityMiningAuction {
         bool active;
     }
 
-    IERC20 public immutable auctionToken; // PNDC
+    // Fee reward share from POW mining: fees accrued while the winner's token is
+    // mined are deposited into that auction's vault and claimed by the winner.
+    struct FeeVault {
+        uint256 amount;
+        bool claimed;
+    }
+
+    IERC20 public immutable auctionToken; // PNDC (bids)
+    IERC20 public immutable feeToken;     // POW-mining fee reward token
     address public owner;
     address public warpDeposit;           // keeper-controlled sink that wraps + bridges the winning PNDC
 
@@ -47,6 +55,7 @@ contract LiquidityMiningAuction {
     mapping(uint256 => Auction) public auctions;
     mapping(uint256 => mapping(address => Position)) public positions;
     mapping(uint256 => address[]) private participants;
+    mapping(uint256 => FeeVault) public feeVaults;
 
     bool public isPaused;
     uint256 private _entered;
@@ -56,6 +65,8 @@ contract LiquidityMiningAuction {
     event Exited(uint256 indexed auctionId, address indexed participant, uint256 amount);
     event AuctionFinalized(uint256 indexed auctionId, address indexed winner, uint256 winningBid);
     event SentToWarp(uint256 indexed auctionId, uint256 amount, address warpDeposit);
+    event FeeDeposited(uint256 indexed auctionId, uint256 amount);
+    event FeeClaimed(uint256 indexed auctionId, address indexed winner, uint256 amount);
     event WarpDepositUpdated(address newDeposit);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event ContractPaused(bool isPaused);
@@ -76,11 +87,13 @@ contract LiquidityMiningAuction {
         _entered = 0;
     }
 
-    constructor(address _auctionToken, address _warpDeposit) {
+    constructor(address _auctionToken, address _feeToken, address _warpDeposit) {
         require(_auctionToken != address(0), "auction token zero");
+        require(_feeToken != address(0), "fee token zero");
         require(_warpDeposit != address(0), "warp deposit zero");
         owner = msg.sender;
         auctionToken = IERC20(_auctionToken);
+        feeToken = IERC20(_feeToken);
         warpDeposit = _warpDeposit;
         _startNewAuction();
     }
@@ -220,6 +233,41 @@ contract LiquidityMiningAuction {
         require(auctionToken.transfer(warpDeposit, amount), "warp transfer failed");
 
         emit SentToWarp(auctionId, amount, warpDeposit);
+    }
+
+    // ------------------------------------------------ fee reward share (POW)
+
+    /// @notice Deposit POW-mining fee rewards into a finalized auction's vault.
+    ///         Claimable by that auction's winner. Permissionless (keepers push
+    ///         fees here as they accrue from mining the winner's token).
+    function depositFee(uint256 auctionId, uint256 amount) external nonReentrant {
+        require(amount > 0, "amount zero");
+        Auction storage a = auctions[auctionId];
+        require(a.finalized, "not finalized");
+        require(a.winner != address(0), "no winner");
+        require(!feeVaults[auctionId].claimed, "already claimed");
+
+        feeVaults[auctionId].amount += amount;
+        require(feeToken.transferFrom(msg.sender, address(this), amount), "fee transfer failed");
+        emit FeeDeposited(auctionId, amount);
+    }
+
+    /// @notice Winner claims the accrued fee reward share for an auction.
+    function claimFee(uint256 auctionId) external nonReentrant {
+        Auction storage a = auctions[auctionId];
+        FeeVault storage v = feeVaults[auctionId];
+        require(msg.sender == a.winner, "only winner");
+        require(!v.claimed, "already claimed");
+        require(v.amount > 0, "nothing to claim");
+
+        uint256 amount = v.amount;
+        v.claimed = true;
+        require(feeToken.transfer(msg.sender, amount), "claim failed");
+        emit FeeClaimed(auctionId, msg.sender, amount);
+    }
+
+    function getFeeVault(uint256 auctionId) external view returns (FeeVault memory) {
+        return feeVaults[auctionId];
     }
 
     // ------------------------------------------------------------------ views

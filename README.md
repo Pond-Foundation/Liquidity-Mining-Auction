@@ -1,10 +1,12 @@
 # Liquidity Mining Auction
 
 A recurring **7-day English auction**: participants deposit PNDC to enter; the
-highest standing deposit at settlement wins. The winning PNDC is released into
-the cross-chain pipeline — **WARP → deBridge → Solana single-side wPOND pool** —
-driven by keepers in `solana-vrf-avs`. The `/mining` liquid-cooling panel is the
-live indicator and the deposit / exit UI.
+highest standing deposit at settlement wins. The winner earns the **fee reward
+share from POW mining** (mining fees accrue to the auction's vault and the winner
+claims them), and the winning PNDC is released into the cross-chain pipeline —
+**WARP → deBridge → Solana single-side wPOND pool** — driven by keepers in
+`solana-vrf-avs`. The `/mining` liquid-cooling panel is the live indicator and
+the deposit / exit UI.
 
 ## Auction rules
 - **Minimum to participate:** 1 trillion PNDC (`MIN_BID = 1e12 × 10¹⁸`).
@@ -22,6 +24,8 @@ live indicator and the deposit / exit UI.
 | `exit()` / `exitAuction(id)` | participant | withdraw full position (winner locked after finalize) |
 | `finalize()` | anyone | after expiry: highest deposit wins, next auction opens |
 | `sendToWarp(id)` | anyone | releases the winning PNDC to the WARP sink |
+| `depositFee(id, amount)` | anyone | POW-mining fee rewards accrue to the auction vault |
+| `claimFee(id)` | winner | claims the fee reward share for a won auction |
 | `getParticipants(id)` / `getAuction(id)` / `getPosition(id,addr)` / `timeRemaining()` | view | UI reads |
 | `setWarpDeposit` / `togglePause` / `transferOwnership` / `emergencyWithdraw` | owner | admin |
 
