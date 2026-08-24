@@ -1,90 +1,53 @@
 # Liquidity Mining Auction
 
-## Overview
-The Liquidity Mining Auction implements a recurring Dutch auction system with integrated permissionless fee distribution. The module manages sequential 42-hour auctions where participants can propose tokens to be liquidity mined by making a bid using PNDC, resulting in winners having the ability to claim mining fees accumulated from mining activity. The token of winning bid is mined until next auction ends.
+A recurring **7-day English auction**: participants deposit PNDC to enter; the
+highest standing deposit at settlement wins. The winning PNDC is released into
+the cross-chain pipeline — **WARP → deBridge → Solana single-side wPOND pool** —
+driven by keepers in `solana-vrf-avs`. The `/mining` liquid-cooling panel is the
+live indicator and the deposit / exit UI.
 
-## Use Case
-- Fee share from POW mining 
-- Liquidity mining of any token (automatic market making)
+## Auction rules
+- **Minimum to participate:** 1 trillion PNDC (`MIN_BID = 1e12 × 10¹⁸`).
+- **Winner:** highest total deposit (English, not Dutch).
+- **Duration:** 7 days per auction, recurring — `finalize()` settles the current
+  one and opens the next.
+- **Deposit / exit:** top up (`deposit`) or withdraw (`exit`) any time the
+  auction is open. After settlement, losers reclaim via `exit`/`exitAuction`;
+  the winner's stake is locked and released with `sendToWarp`.
 
-## Core Mechanisms
+## Contract — `contracts/LiquidityMiningAuction.sol`
+| Function | Who | Notes |
+|---|---|---|
+| `deposit(amount)` | anyone | escrows PNDC into the current auction (total must reach 1T) |
+| `exit()` / `exitAuction(id)` | participant | withdraw full position (winner locked after finalize) |
+| `finalize()` | anyone | after expiry: highest deposit wins, next auction opens |
+| `sendToWarp(id)` | anyone | releases the winning PNDC to the WARP sink |
+| `getParticipants(id)` / `getAuction(id)` / `getPosition(id,addr)` / `timeRemaining()` | view | UI reads |
+| `setWarpDeposit` / `togglePause` / `transferOwnership` / `emergencyWithdraw` | owner | admin |
 
-### Auction Mechanics
-- **Dutch Auction**: Implements a descending price auction where the price decreases linearly over time
-- **Duration**: Each auction runs for exactly 42 hours
-- **Recurring**: New auction starts automatically when the previous one concludes
-- **Price Calculation**: `currentPrice = startingPrice - (discountRate * timeElapsed)`
+Security: checks-effects-interactions on every transfer, a `nonReentrant` guard,
+pull-style loser refunds, and a permissionless `sendToWarp` that can only pay the
+configured sink.
 
-### Token System
-1. **Auction Token - PNDC**
-   - Used for bidding
-   - Transferred from winner to contract upon successful bid
-   - Later, transferred to mining deposit address to be warpped and mined on Solana
+## Pipeline (off-chain, keepers in `solana-vrf-avs`)
+1. `finalize()` settles the auction (permissionless).
+2. `sendToWarp` releases winning PNDC → WARP wrapper `0x4e81…225f8` → **wPOND**.
+3. wPOND → deBridge DLN `0xeF4f…EB66` → Solana receiver `AYg4…53opT`.
+4. Forward `AYg4…53opT` → functionwallet `1orF…iWWL` → single-side wPOND pool.
 
-2. **Fee Token**
-   - Token used for fee distribution
-   - Is deposited from Solana into auction-specific fee vaults
-   - Claimable only by auction winners
+Verified on-chain: PNDC `0x423f4e6138E475D85CF7Ea071AC92097Ed631eea` (18 dec) ·
+wPOND "POND COIN - WARPED" `0x4e810ad33733bef360b12eb59c98c1d5d3a225f8` (18 dec).
 
-## Data Structures
-
-### BidderInfo
-```solidity
-struct BidderInfo {
-    string name;        // Bidder's token identifier
-    string network;     // Network information for token to mine
-    address tokenAddress; // On-chain address of token to mine bytes32
-    address bidderAddress;  // On-chain address of bidder
-}
+## Testing — Foundry
+```bash
+forge install foundry-rs/forge-std   # first time
+forge test                            # unit + fuzz + invariants
+forge test -vvv                       # verbose
 ```
+- `test/LiquidityMiningAuction.t.sol` — unit + fuzz (min-bid boundary, exact
+  refunds), access control, and a reentrant-token attack against the guard.
+- `test/AuctionInvariant.t.sol` — invariants under fuzzed deposit/exit/finalize/warp:
+  **solvency** (contract balance == escrowed) and the **1T floor** for active bidders.
 
-### Auction
-```solidity
-struct Auction {
-    uint256 startAt;        // Auction start timestamp
-    uint256 expiresAt;      // Auction end timestamp
-    uint256 winningBid;     // Winning bid amount
-    address winner;         // Winner's address
-    BidderInfo winnerInfo;  // Winner's metadata
-    bool fundsSentToMine;   // Mining transfer status
-}
-```
-
-### FeeVault
-```solidity
-struct FeeVault {
-    uint256 amount;     // Accumulated fees
-    bool claimed;       // Claim status
-}
-```
-
-## Key Functions
-
-### Auction Operations
-1. `bid(string name, string network, address tokenAddress, address bidderAddress)`
-   - Accepts a bid at current price
-   - Records winner information
-   - Transfers auction tokens
-   - Starts next auction
-
-2. `getPrice()`
-   - Calculates current auction price
-   - Based on time elapsed and discount rate
-   - Returns current valid price
-
-### Fee Management
-1. `depositFee(uint256 amount)`
-   - Deposits fee tokens into last winning auction vault
-   - Requires completed auction
-   - Accumulates fees in vault
-
-2. `claimFee(uint256 auctionId)`
-   - Allows winner to claim accumulated fees in specific vault
-   - One-time claim per auction
-   - Transfers entire vault balance
-
-### Mining Operations
-1. `sendToMine(uint256 auctionId)`
-   - Transfers winning bid to mining deposit
-   - Permissionless execution
-   - One-time operation per auction
+> `LiquidVault-alpha.sol` and `tests/`, `simulators/` are earlier drafts, kept for
+> reference and not part of the Foundry build.
