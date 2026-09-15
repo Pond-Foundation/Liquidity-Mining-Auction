@@ -26,7 +26,8 @@ contract AuctionTest is Test {
     function setUp() public {
         pndc = new MockERC20("Pond Coin", "PNDC");
         fee = new MockERC20("Fee Reward", "FEE");
-        auction = new LiquidityMiningAuction(address(pndc), address(fee), warp);
+        auction = new LiquidityMiningAuction(address(pndc), address(fee), _terms(warp));
+        auction.setPaused(false);
         _fund(alice, 5 * ONE_T);
         _fund(bob, 5 * ONE_T);
         _fund(carol, 5 * ONE_T);
@@ -50,14 +51,14 @@ contract AuctionTest is Test {
     function test_rejectsBelowMinimum() public {
         vm.prank(alice);
         vm.expectRevert("below 1T minimum");
-        auction.deposit(ONE_T - 1);
+        auction.deposit(1, ONE_T - 1, block.timestamp + 300);
     }
 
     function test_depositAtMinimum() public {
         vm.expectEmit(true, true, false, true, address(auction));
         emit Deposited(1, alice, ONE_T, ONE_T);
         vm.prank(alice);
-        auction.deposit(ONE_T);
+        auction.deposit(1, ONE_T, block.timestamp + 300);
         assertEq(auction.getPosition(1, alice), ONE_T);
         assertEq(auction.participantCount(1), 1);
         assertEq(pndc.balanceOf(address(auction)), ONE_T);
@@ -65,8 +66,8 @@ contract AuctionTest is Test {
 
     function test_topUpKeepsSingleParticipant() public {
         vm.startPrank(alice);
-        auction.deposit(ONE_T);
-        auction.deposit(ONE_T / 2);
+        auction.deposit(1, ONE_T, block.timestamp + 300);
+        auction.deposit(1, ONE_T / 2, block.timestamp + 300);
         vm.stopPrank();
         assertEq(auction.getPosition(1, alice), ONE_T + ONE_T / 2);
         assertEq(auction.participantCount(1), 1);
@@ -80,7 +81,7 @@ contract AuctionTest is Test {
         vm.warp(block.timestamp + DURATION + 1);
         vm.expectEmit(true, true, false, true, address(auction));
         emit AuctionFinalized(1, bob, 3 * ONE_T);
-        auction.finalize();
+        auction.finalize(1);
 
         LiquidityMiningAuction.Auction memory a = auction.getAuction(1);
         assertTrue(a.finalized);
@@ -110,14 +111,14 @@ contract AuctionTest is Test {
         vm.warp(block.timestamp + DURATION + 1);
         vm.prank(alice);
         vm.expectRevert("auction ended");
-        auction.deposit(ONE_T);
+        auction.deposit(1, ONE_T, block.timestamp + 300);
     }
 
     function test_loserExitsWinnerLocked() public {
         _deposit(alice, ONE_T); // loser
         _deposit(bob, 3 * ONE_T); // winner
         vm.warp(block.timestamp + DURATION + 1);
-        auction.finalize();
+        auction.finalize(1);
 
         uint256 before = pndc.balanceOf(alice);
         vm.prank(alice);
@@ -133,7 +134,7 @@ contract AuctionTest is Test {
         _deposit(alice, ONE_T);
         _deposit(bob, 3 * ONE_T);
         vm.warp(block.timestamp + DURATION + 1);
-        auction.finalize();
+        auction.finalize(1);
 
         uint256 before = pndc.balanceOf(warp);
         vm.expectEmit(true, false, false, true, address(auction));
@@ -149,14 +150,14 @@ contract AuctionTest is Test {
         _deposit(alice, ONE_T);
         _deposit(bob, 3 * ONE_T); // winner
         vm.warp(block.timestamp + DURATION + 1);
-        auction.finalize();
+        auction.finalize(1);
 
         // POW-mining fees accrue into the auction's vault
         uint256 feeAmt = 5 ether;
         fee.mint(address(this), feeAmt);
         fee.approve(address(auction), feeAmt);
         auction.depositFee(1, feeAmt);
-        assertEq(auction.getFeeVault(1).amount, feeAmt);
+        assertEq(auction.getFeeVault(1).funded, feeAmt);
 
         vm.prank(alice); // loser
         vm.expectRevert("only winner");
@@ -168,7 +169,7 @@ contract AuctionTest is Test {
         assertEq(fee.balanceOf(bob), before + feeAmt);
 
         vm.prank(bob);
-        vm.expectRevert("already claimed");
+        vm.expectRevert("nothing to claim");
         auction.claimFee(1);
     }
 
@@ -183,7 +184,7 @@ contract AuctionTest is Test {
     function test_finalizeBeforeExpiryReverts() public {
         _deposit(alice, ONE_T);
         vm.expectRevert("not ended");
-        auction.finalize();
+        auction.finalize(1);
     }
 
     /* --------------------------------------------------- access control */
@@ -191,33 +192,34 @@ contract AuctionTest is Test {
     function test_onlyOwnerGuards() public {
         vm.startPrank(alice);
         vm.expectRevert("not owner");
-        auction.setWarpDeposit(alice);
+        auction.scheduleTerms(_terms(alice));
         vm.expectRevert("not owner");
-        auction.togglePause();
+        auction.setPaused(true);
         vm.expectRevert("not owner");
         auction.transferOwnership(alice);
         vm.expectRevert("not owner");
-        auction.emergencyWithdraw(IERC20(address(pndc)));
+        auction.recoverSurplus(IERC20(address(pndc)), alice, 1);
         vm.stopPrank();
     }
 
     function test_pauseBlocksDeposits() public {
-        auction.togglePause(); // test contract is owner
+        auction.setPaused(true); // test contract is owner
         vm.prank(alice);
         vm.expectRevert("paused");
-        auction.deposit(ONE_T);
+        auction.deposit(1, ONE_T, block.timestamp + 300);
     }
 
     /* ----------------------------------------------------- reentrancy */
 
     function test_reentrancyGuardBlocksExitReenter() public {
         ReentrantToken evil = new ReentrantToken();
-        LiquidityMiningAuction a2 = new LiquidityMiningAuction(address(evil), address(fee), warp);
+        LiquidityMiningAuction a2 = new LiquidityMiningAuction(address(evil), address(fee), _terms(warp));
+        a2.setPaused(false);
         evil.mint(alice, 3 * ONE_T);
         vm.prank(alice);
         evil.approve(address(a2), type(uint256).max);
         vm.prank(alice);
-        a2.deposit(3 * ONE_T);
+        a2.deposit(1, 3 * ONE_T, block.timestamp + 300);
 
         // arm the token to re-enter exit() during the refund transfer
         evil.setAttack(IAuction(address(a2)), true, 0);
@@ -235,7 +237,7 @@ contract AuctionTest is Test {
         uint256 before = pndc.balanceOf(alice);
 
         vm.prank(alice);
-        auction.deposit(requested);
+        auction.deposit(1, requested, block.timestamp + 300);
 
         assertEq(auction.getPosition(1, alice), expected);
         assertEq(pndc.balanceOf(alice), before - expected); // dust never pulled
@@ -251,12 +253,12 @@ contract AuctionTest is Test {
         pndc.approve(address(auction), type(uint256).max);
         if (rounded == 0) {
             vm.expectRevert("amount zero");
-            auction.deposit(amt);
+            auction.deposit(1, amt, block.timestamp + 300);
         } else if (rounded < ONE_T) {
             vm.expectRevert("below 1T minimum");
-            auction.deposit(amt);
+            auction.deposit(1, amt, block.timestamp + 300);
         } else {
-            auction.deposit(amt);
+            auction.deposit(1, amt, block.timestamp + 300);
             assertEq(auction.getPosition(1, alice), rounded);
         }
         vm.stopPrank();
@@ -273,10 +275,14 @@ contract AuctionTest is Test {
         assertEq(auction.getPosition(1, alice), 0);
     }
 
+    function _terms(address sink) internal view returns (LiquidityMiningAuction.Terms memory) {
+        return LiquidityMiningAuction.Terms(sink, address(this), 10000, keccak256("test-policy"));
+    }
+
     /* -------------------------------------------------------- helpers */
 
     function _deposit(address who, uint256 amt) internal {
         vm.prank(who);
-        auction.deposit(amt);
+        auction.deposit(1, amt, block.timestamp + 300);
     }
 }

@@ -7,26 +7,21 @@ interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
 }
 
-/// @title LiquidityMiningAuction — recurring 7-day English auction
-/// @notice Participants deposit PNDC to enter the current auction; the highest
-///         standing deposit at settlement wins. Deposits can be topped up
-///         (`deposit`) or withdrawn (`exit`) while the auction is open. When it
-///         closes, `finalize()` records the winner and opens the next auction;
-///         losers reclaim their PNDC with `exit`, and the winning PNDC is
-///         released to the WARP pipeline (`sendToWarp`) which wraps → deBridge →
-///         Solana single-side wPOND pool (driven by keepers on solana-vrf-avs).
-/// @dev    The UI reads `getAuction` + `getParticipants` and calls
-///         `deposit` / `exit`. No per-bid token proposal: the output is always
-///         the wPOND single-side pool.
+/// @notice Round-bound English auction. Winning PNDC goes to a pinned executor;
+/// that transfer is not evidence of wrapper minting or cross-chain delivery.
 contract LiquidityMiningAuction {
+    uint256 public constant VERSION = 2;
     uint256 public constant AUCTION_DURATION = 7 days;
-    // 1 trillion PNDC minimum to participate. PNDC has 18 decimals, so
-    // 1e12 tokens * 1e18 = 1e30 raw. (`ether` == 1e18.)
     uint256 public constant MIN_BID = 1_000_000_000_000 ether;
-    // Deposits round down to whole billions of PNDC — no odd fractional amounts.
-    // 1e9 tokens * 1e18 = 1e27 raw.
     uint256 public constant ONE_BILLION = 1_000_000_000 ether;
-
+    uint256 public constant MAX_PARTICIPANTS = 256;
+    uint256 public constant OWNERSHIP_DELAY = 2 days;
+    struct Terms {
+        address warpDeposit;
+        address protocolFeeRecipient;
+        uint16 winnerShareBps;
+        bytes32 policyHash;
+    }
     struct Auction {
         uint256 startAt;
         uint256 expiresAt;
@@ -35,312 +30,243 @@ contract LiquidityMiningAuction {
         uint256 winningBid;
         bool sentToWarp;
     }
-
-    struct Position {
-        uint256 amount;   // total PNDC escrowed by this participant
-        uint256 index;    // index into participants[auctionId]
-        bool active;
-    }
-
-    // Fee reward share from POW mining: fees accrued while the winner's token is
-    // mined are deposited into that auction's vault and claimed by the winner.
-    struct FeeVault {
-        uint256 amount;
-        bool claimed;
-    }
-
-    IERC20 public immutable auctionToken; // PNDC (bids)
-    IERC20 public immutable feeToken;     // POW-mining fee reward token
+    struct Position { uint256 amount; uint256 index; bool active; uint256 sequence; }
+    struct FeeVault { uint256 funded; uint256 claimed; }
+    IERC20 public immutable auctionToken;
+    IERC20 public immutable feeToken;
     address public owner;
-    address public warpDeposit;           // keeper-controlled sink that wraps + bridges the winning PNDC
-
+    address public pendingOwner;
+    uint256 public ownershipReadyAt;
+    Terms public nextTerms;
+    mapping(uint256 => Terms) public auctionTerms;
     uint256 public currentAuctionId;
     mapping(uint256 => Auction) public auctions;
     mapping(uint256 => mapping(address => Position)) public positions;
     mapping(uint256 => address[]) private participants;
     mapping(uint256 => FeeVault) public feeVaults;
-
+    mapping(address => uint256) public protocolFees;
+    uint256 public totalEscrowed;
+    uint256 public totalFeeLiability;
+    uint256 private sequence;
+    uint256 private entered;
     bool public isPaused;
-    uint256 private _entered;
+    bool public hasLaunched;
 
     event AuctionStarted(uint256 indexed auctionId, uint256 startAt, uint256 expiresAt);
+    event TermsScheduled(address warpDeposit, address protocolFeeRecipient, uint16 winnerShareBps, bytes32 policyHash);
+    event TermsActivated(uint256 indexed auctionId, address warpDeposit, address protocolFeeRecipient, uint16 winnerShareBps, bytes32 policyHash);
     event Deposited(uint256 indexed auctionId, address indexed participant, uint256 amount, uint256 total);
     event Exited(uint256 indexed auctionId, address indexed participant, uint256 amount);
     event AuctionFinalized(uint256 indexed auctionId, address indexed winner, uint256 winningBid);
     event SentToWarp(uint256 indexed auctionId, uint256 amount, address warpDeposit);
-    event FeeDeposited(uint256 indexed auctionId, uint256 amount);
+    event FeeDeposited(uint256 indexed auctionId, uint256 grossAmount, uint256 winnerAmount, uint256 protocolAmount);
     event FeeClaimed(uint256 indexed auctionId, address indexed winner, uint256 amount);
-    event WarpDepositUpdated(address newDeposit);
+    event ProtocolFeesClaimed(address indexed recipient, uint256 amount);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed nextOwner, uint256 readyAt);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event ContractPaused(bool isPaused);
-    event EmergencyWithdraw(address token, uint256 amount);
+    event SurplusRecovered(address indexed token, address indexed recipient, uint256 amount);
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "not owner");
-        _;
-    }
-    modifier notPaused() {
-        require(!isPaused, "paused");
-        _;
-    }
-    modifier nonReentrant() {
-        require(_entered == 0, "reentrant");
-        _entered = 1;
-        _;
-        _entered = 0;
-    }
+    modifier onlyOwner() { require(msg.sender == owner, "not owner"); _; }
+    modifier nonReentrant() { require(entered == 0, "reentrant"); entered = 1; _; entered = 0; }
+    modifier notPaused() { require(!isPaused, "paused"); _; }
 
-    constructor(address _auctionToken, address _feeToken, address _warpDeposit) {
-        require(_auctionToken != address(0), "auction token zero");
-        require(_feeToken != address(0), "fee token zero");
-        require(_warpDeposit != address(0), "warp deposit zero");
+    constructor(address pndc, address rewardToken, Terms memory terms) {
+        require(pndc.code.length > 0 && rewardToken.code.length > 0, "invalid token");
+        _validateTerms(terms);
+        auctionToken = IERC20(pndc);
+        feeToken = IERC20(rewardToken);
         owner = msg.sender;
-        auctionToken = IERC20(_auctionToken);
-        feeToken = IERC20(_feeToken);
-        warpDeposit = _warpDeposit;
+        nextTerms = terms;
+        isPaused = true;
         _startNewAuction();
     }
-
+    function _validateTerms(Terms memory terms) internal view {
+        require(terms.warpDeposit != address(0) && terms.warpDeposit != address(this), "invalid warp deposit");
+        require(terms.protocolFeeRecipient != address(0) && terms.protocolFeeRecipient != address(this), "invalid fee recipient");
+        require(terms.winnerShareBps <= 10_000 && terms.policyHash != bytes32(0), "invalid policy");
+    }
     function _startNewAuction() internal {
-        currentAuctionId++;
-        uint256 startAt = block.timestamp;
-        uint256 expiresAt = startAt + AUCTION_DURATION;
-        auctions[currentAuctionId] = Auction({
-            startAt: startAt,
-            expiresAt: expiresAt,
-            finalized: false,
-            winner: address(0),
-            winningBid: 0,
-            sentToWarp: false
-        });
-        emit AuctionStarted(currentAuctionId, startAt, expiresAt);
+        uint256 id = ++currentAuctionId;
+        auctions[id] = Auction(block.timestamp, block.timestamp + AUCTION_DURATION, false, address(0), 0, false);
+        auctionTerms[id] = nextTerms;
+        emit AuctionStarted(id, block.timestamp, block.timestamp + AUCTION_DURATION);
+        emit TermsActivated(id, nextTerms.warpDeposit, nextTerms.protocolFeeRecipient, nextTerms.winnerShareBps, nextTerms.policyHash);
     }
-
-    /// @notice Deposit PNDC into the current auction (tops up an existing position).
-    ///         Total position must reach the 1T minimum to be active.
-    function deposit(uint256 amount) external notPaused nonReentrant {
-        // round down to whole billions — no odd fractional deposits
-        amount = amount - (amount % ONE_BILLION);
+    /// @notice Never accept a delayed transaction into a different round.
+    function deposit(uint256 auctionId, uint256 amount, uint256 deadline) external notPaused nonReentrant {
+        require(auctionId == currentAuctionId, "wrong auction");
+        require(block.timestamp <= deadline && block.timestamp < auctions[auctionId].expiresAt, "auction ended");
+        amount -= amount % ONE_BILLION;
         require(amount > 0, "amount zero");
-        uint256 id = currentAuctionId;
-        Auction storage a = auctions[id];
-        require(block.timestamp < a.expiresAt, "auction ended");
-
-        Position storage p = positions[id][msg.sender];
-        uint256 newTotal = p.amount + amount;
-        require(newTotal >= MIN_BID, "below 1T minimum");
-
-        // effects
-        p.amount = newTotal;
-        if (!p.active) {
-            p.active = true;
-            p.index = participants[id].length;
-            participants[id].push(msg.sender);
-        }
-
-        // interaction
-        require(auctionToken.transferFrom(msg.sender, address(this), amount), "transfer failed");
-
-        emit Deposited(id, msg.sender, amount, newTotal);
-    }
-
-    /// @notice Withdraw your entire position from the current auction.
-    function exit() external nonReentrant {
-        _exit(currentAuctionId);
-    }
-
-    /// @notice Withdraw your position from a specific auction (e.g. after it
-    ///         finalized and you did not win).
-    function exitAuction(uint256 auctionId) external nonReentrant {
-        _exit(auctionId);
-    }
-
-    function _exit(uint256 auctionId) internal {
         Position storage p = positions[auctionId][msg.sender];
-        require(p.active && p.amount > 0, "no position");
-
-        Auction storage a = auctions[auctionId];
-        // once finalized, the winner's stake is locked for the WARP pipeline
-        if (a.finalized) {
-            require(msg.sender != a.winner, "winner locked");
+        require(p.amount + amount >= MIN_BID, "below 1T minimum");
+        if (!p.active) {
+            require(participants[auctionId].length < MAX_PARTICIPANTS, "participant limit");
+            p.index = participants[auctionId].length;
+            p.active = true;
+            participants[auctionId].push(msg.sender);
         }
-
+        p.amount += amount;
+        p.sequence = ++sequence;
+        totalEscrowed += amount;
+        _receiveExact(auctionToken, amount);
+        emit Deposited(auctionId, msg.sender, amount, p.amount);
+    }
+    function exit() external nonReentrant { _exit(currentAuctionId); }
+    function exitAuction(uint256 id) external nonReentrant { _exit(id); }
+    function _exit(uint256 id) internal {
+        Position storage p = positions[id][msg.sender];
+        require(p.active && p.amount > 0, "no position");
+        Auction storage a = auctions[id];
+        if (a.finalized) require(msg.sender != a.winner, "winner locked");
+        else require(block.timestamp < a.expiresAt, "await settlement");
         uint256 amount = p.amount;
-
-        // effects
         p.amount = 0;
         p.active = false;
-        _removeParticipant(auctionId, msg.sender, p.index);
-
-        // interaction
-        require(auctionToken.transfer(msg.sender, amount), "refund failed");
-
-        emit Exited(auctionId, msg.sender, amount);
-    }
-
-    function _removeParticipant(uint256 auctionId, address who, uint256 idx) internal {
-        address[] storage arr = participants[auctionId];
+        totalEscrowed -= amount;
+        address[] storage arr = participants[id];
         uint256 last = arr.length - 1;
-        if (idx != last) {
+        if (p.index != last) {
             address moved = arr[last];
-            arr[idx] = moved;
-            positions[auctionId][moved].index = idx;
+            arr[p.index] = moved;
+            positions[id][moved].index = p.index;
         }
         arr.pop();
-        // silence unused-var warnings in some compilers
-        who;
+        require(auctionToken.transfer(msg.sender, amount), "refund failed");
+        emit Exited(id, msg.sender, amount);
     }
-
-    /// @notice Settle the current auction after it expires: the highest standing
-    ///         deposit wins, and the next auction opens. Permissionless.
-    function finalize() external nonReentrant {
-        uint256 id = currentAuctionId;
-        Auction storage a = auctions[id];
+    /// @notice At most MAX_PARTICIPANTS entries. Safe settlement remains available while paused.
+    function finalize(uint256 expectedAuctionId) external nonReentrant {
+        require(hasLaunched, "not launched");
+        require(expectedAuctionId == currentAuctionId, "wrong auction");
+        Auction storage a = auctions[expectedAuctionId];
         require(block.timestamp >= a.expiresAt, "not ended");
         require(!a.finalized, "already finalized");
-
-        a.finalized = true;
-
-        address[] storage arr = participants[id];
-        address win;
-        uint256 best;
-        for (uint256 i = 0; i < arr.length; i++) {
-            uint256 amt = positions[id][arr[i]].amount;
-            if (amt > best) {
-                best = amt;
-                win = arr[i];
+        address[] storage arr = participants[expectedAuctionId];
+        uint256 first = type(uint256).max;
+        for (uint256 i; i < arr.length; ++i) {
+            Position storage p = positions[expectedAuctionId][arr[i]];
+            if (p.amount > a.winningBid || (p.amount == a.winningBid && p.sequence < first)) {
+                a.winner = arr[i]; a.winningBid = p.amount; first = p.sequence;
             }
         }
-        a.winner = win;
-        a.winningBid = best;
-
-        emit AuctionFinalized(id, win, best);
+        a.finalized = true;
+        emit AuctionFinalized(expectedAuctionId, a.winner, a.winningBid);
         _startNewAuction();
     }
-
-    /// @notice Release the winning PNDC to the WARP pipeline. Permissionless
-    ///         (funds can only go to the configured `warpDeposit`).
-    function sendToWarp(uint256 auctionId) external nonReentrant {
-        Auction storage a = auctions[auctionId];
+    function sendToWarp(uint256 id) external notPaused nonReentrant {
+        Auction storage a = auctions[id];
         require(a.finalized, "not finalized");
         require(a.winner != address(0), "no winner");
         require(!a.sentToWarp, "already sent");
-        require(warpDeposit != address(0), "no warp deposit");
-
-        uint256 amount = positions[auctionId][a.winner].amount;
+        uint256 amount = positions[id][a.winner].amount;
         require(amount > 0, "nothing to send");
-
-        // effects
-        positions[auctionId][a.winner].amount = 0;
+        positions[id][a.winner].amount = 0;
+        totalEscrowed -= amount;
         a.sentToWarp = true;
-
-        // interaction
-        require(auctionToken.transfer(warpDeposit, amount), "warp transfer failed");
-
-        emit SentToWarp(auctionId, amount, warpDeposit);
+        address recipient = auctionTerms[id].warpDeposit;
+        uint256 beforeBalance = auctionToken.balanceOf(recipient);
+        require(auctionToken.transfer(recipient, amount), "warp transfer failed");
+        require(auctionToken.balanceOf(recipient) == beforeBalance + amount, "inexact warp transfer");
+        emit SentToWarp(id, amount, recipient);
     }
-
-    // ------------------------------------------------ fee reward share (POW)
-
-    /// @notice Deposit POW-mining fee rewards into a finalized auction's vault.
-    ///         Claimable by that auction's winner. Permissionless (keepers push
-    ///         fees here as they accrue from mining the winner's token).
-    function depositFee(uint256 auctionId, uint256 amount) external nonReentrant {
+    /// @notice Fund gross eligible fees; split is enforced by immutable round terms.
+    function depositFee(uint256 id, uint256 amount) external nonReentrant {
         require(amount > 0, "amount zero");
-        Auction storage a = auctions[auctionId];
-        require(a.finalized, "not finalized");
-        require(a.winner != address(0), "no winner");
-        require(!feeVaults[auctionId].claimed, "already claimed");
-
-        feeVaults[auctionId].amount += amount;
-        require(feeToken.transferFrom(msg.sender, address(this), amount), "fee transfer failed");
-        emit FeeDeposited(auctionId, amount);
+        require(auctions[id].finalized, "not finalized");
+        require(auctions[id].winner != address(0), "no winner");
+        Terms storage terms = auctionTerms[id];
+        uint256 winnerAmount = (amount / 10_000) * terms.winnerShareBps
+            + ((amount % 10_000) * terms.winnerShareBps) / 10_000;
+        uint256 protocolAmount = amount - winnerAmount;
+        feeVaults[id].funded += winnerAmount;
+        protocolFees[terms.protocolFeeRecipient] += protocolAmount;
+        totalFeeLiability += amount;
+        _receiveExact(feeToken, amount);
+        emit FeeDeposited(id, amount, winnerAmount, protocolAmount);
     }
-
-    /// @notice Winner claims the accrued fee reward share for an auction.
-    function claimFee(uint256 auctionId) external nonReentrant {
-        Auction storage a = auctions[auctionId];
-        FeeVault storage v = feeVaults[auctionId];
-        require(msg.sender == a.winner, "only winner");
-        require(!v.claimed, "already claimed");
-        require(v.amount > 0, "nothing to claim");
-
-        uint256 amount = v.amount;
-        v.claimed = true;
+    function claimFee(uint256 id) external nonReentrant {
+        require(msg.sender == auctions[id].winner, "only winner");
+        _claim(id);
+    }
+    /// @notice Gas may be sponsored; the reward can only reach the recorded winner.
+    function claimFor(uint256 id) external nonReentrant { _claim(id); }
+    function _claim(uint256 id) internal {
+        FeeVault storage vault = feeVaults[id];
+        uint256 amount = vault.funded - vault.claimed;
+        require(amount > 0, "nothing to claim");
+        vault.claimed += amount;
+        totalFeeLiability -= amount;
+        address winner = auctions[id].winner;
+        require(feeToken.transfer(winner, amount), "claim failed");
+        emit FeeClaimed(id, winner, amount);
+    }
+    function claimProtocolFees() external nonReentrant {
+        uint256 amount = protocolFees[msg.sender];
+        require(amount > 0, "nothing to claim");
+        protocolFees[msg.sender] = 0;
+        totalFeeLiability -= amount;
         require(feeToken.transfer(msg.sender, amount), "claim failed");
-        emit FeeClaimed(auctionId, msg.sender, amount);
+        emit ProtocolFeesClaimed(msg.sender, amount);
     }
-
-    function getFeeVault(uint256 auctionId) external view returns (FeeVault memory) {
-        return feeVaults[auctionId];
+    function _receiveExact(IERC20 token, uint256 amount) internal {
+        uint256 beforeBalance = token.balanceOf(address(this));
+        require(token.transferFrom(msg.sender, address(this), amount), "transfer failed");
+        require(token.balanceOf(address(this)) == beforeBalance + amount, "inexact transfer");
     }
-
-    // ------------------------------------------------------------------ views
-
+    function getFeeVault(uint256 id) external view returns (FeeVault memory) { return feeVaults[id]; }
+    function getAuction(uint256 id) external view returns (Auction memory) { return auctions[id]; }
+    function getPosition(uint256 id, address who) external view returns (uint256) { return positions[id][who].amount; }
+    function participantCount(uint256 id) external view returns (uint256) { return participants[id].length; }
+    function getParticipants(uint256 id) external view returns (address[] memory addrs, uint256[] memory amounts) {
+        addrs = participants[id];
+        amounts = new uint256[](addrs.length);
+        for (uint256 i; i < addrs.length; ++i) amounts[i] = positions[id][addrs[i]].amount;
+    }
     function timeRemaining() external view returns (uint256) {
-        Auction storage a = auctions[currentAuctionId];
-        if (block.timestamp >= a.expiresAt) return 0;
-        return a.expiresAt - block.timestamp;
+        uint256 end = auctions[currentAuctionId].expiresAt;
+        return block.timestamp < end ? end - block.timestamp : 0;
     }
-
-    function participantCount(uint256 auctionId) external view returns (uint256) {
-        return participants[auctionId].length;
+    function scheduleTerms(Terms calldata terms) external onlyOwner {
+        _validateTerms(terms);
+        nextTerms = terms;
+        emit TermsScheduled(terms.warpDeposit, terms.protocolFeeRecipient, terms.winnerShareBps, terms.policyHash);
     }
-
-    /// @notice All active participants of an auction with their deposit amounts.
-    ///         The UI sorts these to render the leaderboard (top depositors).
-    function getParticipants(uint256 auctionId)
-        external
-        view
-        returns (address[] memory addrs, uint256[] memory amounts)
-    {
-        address[] storage arr = participants[auctionId];
-        addrs = new address[](arr.length);
-        amounts = new uint256[](arr.length);
-        for (uint256 i = 0; i < arr.length; i++) {
-            addrs[i] = arr[i];
-            amounts[i] = positions[auctionId][arr[i]].amount;
+    function setPaused(bool paused) external onlyOwner {
+        if (!paused && !hasLaunched) {
+            hasLaunched = true;
+            Auction storage first = auctions[1];
+            first.startAt = block.timestamp;
+            first.expiresAt = block.timestamp + AUCTION_DURATION;
+            emit AuctionStarted(1, first.startAt, first.expiresAt);
         }
+        isPaused = paused;
+        emit ContractPaused(paused);
     }
-
-    function getPosition(uint256 auctionId, address who) external view returns (uint256) {
-        return positions[auctionId][who].amount;
-    }
-
-    function getAuction(uint256 auctionId) external view returns (Auction memory) {
-        return auctions[auctionId];
-    }
-
-    // -------------------------------------------------------------- ownership
-
-    function setWarpDeposit(address _warpDeposit) external onlyOwner {
-        require(_warpDeposit != address(0), "zero");
-        warpDeposit = _warpDeposit;
-        emit WarpDepositUpdated(_warpDeposit);
-    }
-
-    function togglePause() external onlyOwner {
-        isPaused = !isPaused;
-        emit ContractPaused(isPaused);
-    }
-
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "zero");
-        address prev = owner;
-        owner = newOwner;
-        emit OwnershipTransferred(prev, newOwner);
+        pendingOwner = newOwner;
+        ownershipReadyAt = block.timestamp + OWNERSHIP_DELAY;
+        emit OwnershipTransferStarted(owner, newOwner, ownershipReadyAt);
     }
-
-    /// @notice Owner escape hatch: pauses and sweeps a token to the owner.
-    ///         Only intended for emergencies; open auctions should be settled
-    ///         normally so participants can `exit`.
-    function emergencyWithdraw(IERC20 token) external onlyOwner {
-        require(address(token) != address(0), "zero");
-        isPaused = true;
-        emit ContractPaused(true);
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner && block.timestamp >= ownershipReadyAt, "ownership not ready");
+        address previous = owner;
+        owner = pendingOwner;
+        pendingOwner = address(0);
+        ownershipReadyAt = 0;
+        emit OwnershipTransferred(previous, owner);
+    }
+    /// @notice Recovery can never consume refundable bids or funded fee liabilities.
+    function recoverSurplus(IERC20 token, address recipient, uint256 amount) external onlyOwner nonReentrant {
+        require(recipient != address(0) && amount > 0, "invalid recovery");
+        uint256 reserved;
+        if (address(token) == address(auctionToken)) reserved += totalEscrowed;
+        if (address(token) == address(feeToken)) reserved += totalFeeLiability;
         uint256 balance = token.balanceOf(address(this));
-        require(balance > 0, "no balance");
-        require(token.transfer(owner, balance), "withdraw failed");
-        emit EmergencyWithdraw(address(token), balance);
+        require(balance >= reserved && amount <= balance - reserved, "reserved funds");
+        require(token.transfer(recipient, amount), "recovery failed");
+        emit SurplusRecovered(address(token), recipient, amount);
     }
 }

@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 interface IAuction {
     function exit() external;
-    function deposit(uint256 amount) external;
+    function deposit(uint256 id, uint256 amount, uint256 deadline) external;
 }
 
 /// A malicious 18-decimal ERC20 that attempts to re-enter the auction from
@@ -43,7 +43,7 @@ contract ReentrantToken {
         if (attack && address(target) != address(0)) {
             attack = false; // one shot
             if (mode == 0) target.exit();
-            else target.deposit(1);
+            else target.deposit(1, 1, block.timestamp + 300);
         }
     }
 

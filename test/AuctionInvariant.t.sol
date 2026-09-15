@@ -38,7 +38,7 @@ contract Handler is Test {
         pndc.mint(who, amt);
         vm.startPrank(who);
         pndc.approve(address(auction), type(uint256).max);
-        try auction.deposit(amt) { ghostEscrowed += amt; } catch {}
+        try auction.deposit(id, amt, block.timestamp + 300) { ghostEscrowed += amt; } catch {}
         vm.stopPrank();
     }
 
@@ -55,7 +55,7 @@ contract Handler is Test {
         uint256 id = auction.currentAuctionId();
         LiquidityMiningAuction.Auction memory a = auction.getAuction(id);
         vm.warp(a.expiresAt + 1);
-        try auction.finalize() { lastFinalizedId = id; } catch {}
+        try auction.finalize(id) { lastFinalizedId = id; } catch {}
     }
 
     function warpOut() external {
@@ -75,7 +75,8 @@ contract AuctionInvariantTest is Test {
     function setUp() public {
         pndc = new MockERC20("Pond Coin", "PNDC");
         MockERC20 feeTok = new MockERC20("Fee Reward", "FEE");
-        auction = new LiquidityMiningAuction(address(pndc), address(feeTok), makeAddr("warp"));
+        auction = new LiquidityMiningAuction(address(pndc), address(feeTok), LiquidityMiningAuction.Terms(makeAddr("warp"), address(this), 10000, keccak256("test-policy")));
+        auction.setPaused(false);
         handler = new Handler(auction, pndc);
         targetContract(address(handler));
     }
