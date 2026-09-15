@@ -1,57 +1,39 @@
-# Liquidity Mining Auction
+# Warped: English V2 liquidity auction
 
-A recurring **7-day English auction**: participants deposit PNDC to enter; the
-highest standing deposit at settlement wins. The winner earns the **fee reward
-share from POW mining** (mining fees accrue to the auction's vault and the winner
-claims them), and the winning PNDC is released into the cross-chain pipeline —
-**WARP → deBridge → Solana single-side wPOND pool** — driven by keepers in
-`solana-vrf-avs`. The `/mining` liquid-cooling panel is the live indicator and
-the deposit / exit UI.
+A recurring seven-day English auction escrows PNDC. The highest standing bid at expiry wins a round-pinned fee entitlement. The winning PNDC is released to the disclosed warp custodian for protocol liquidity. Losing bidders recover their PNDC. This is a new deployment; the legacy Dutch address is not compatible with this ABI.
 
-## Auction rules
-- **Minimum to participate:** 1 trillion PNDC (`MIN_BID = 1e12 × 10¹⁸`).
-- **Winner:** highest total deposit (English, not Dutch).
-- **Duration:** 7 days per auction, recurring — `finalize()` settles the current
-  one and opens the next.
-- **Deposit / exit:** top up (`deposit`) or withdraw (`exit`) any time the
-  auction is open. After settlement, losers reclaim via `exit`/`exitAuction`;
-  the winner's stake is locked and released with `sendToWarp`.
+The contract deploys paused. The owner's first launch starts a full seven-day window. First bids require one trillion PNDC; top-ups are whole billions. Ties favor the bidder who first reached that total. Exits are blocked after expiry until settlement, and a finalized winner cannot refund the winning stake.
 
-## Contract — `contracts/LiquidityMiningAuction.sol`
-| Function | Who | Notes |
-|---|---|---|
-| `deposit(amount)` | anyone | escrows PNDC into the current auction (total must reach 1T) |
-| `exit()` / `exitAuction(id)` | participant | withdraw full position (winner locked after finalize) |
-| `finalize()` | anyone | after expiry: highest deposit wins, next auction opens |
-| `sendToWarp(id)` | anyone | releases the winning PNDC to the WARP sink |
-| `depositFee(id, amount)` | anyone | POW-mining fee rewards accrue to the auction vault |
-| `claimFee(id)` | winner | claims the fee reward share for a won auction |
-| `getParticipants(id)` / `getAuction(id)` / `getPosition(id,addr)` / `timeRemaining()` | view | UI reads |
-| `setWarpDeposit` / `togglePause` / `transferOwnership` / `emergencyWithdraw` | owner | admin |
+| Function | Access and effect |
+| --- | --- |
+| `deposit(id, amount, deadline)` | Bidder; binds the intended round and expiry |
+| `exit()` / `exitAuction(id)` | Bidder refund before expiry or after losing settlement |
+| `finalize(expectedId)` | Permissionless settlement of a launched expired round |
+| `sendToWarp(id)` | Permissionless exact PNDC transfer to that round's pinned custodian |
+| `depositFee(id, grossAmount)` | Splits deposited payout tokens between winner and protocol liabilities |
+| `claimFee(id)` / `claimFor(id)` | Winner claim or sponsored claim, always to the recorded winner |
+| `claimProtocolFees()` | Claims only the caller's reserved protocol share |
+| `scheduleTerms(terms)` | Owner; applies custody, share and disclosure hash to future rounds |
+| `setPaused(bool)` | Owner; pauses new bidding and release, preserving refunds and claims |
+| `recoverSurplus(token, recipient, amount)` | Owner; excludes escrow and both fee liabilities |
+| `transferOwnership` / `acceptOwnership` | Two-step owner transfer with a two-day acceptance delay |
 
-Security: checks-effects-interactions on every transfer, a `nonReentrant` guard,
-pull-style loser refunds, and a permissionless `sendToWarp` that can only pay the
-configured sink.
+Fee funding is cumulative, so winners can claim again when new funding arrives. The AVS integration currently supports gross, verified protocol funding received during the auction window. Automatic POW/user-mining, swap and LP fee attribution is not implemented; the contract does not manufacture that income. Fee terms and recipients cannot be changed retroactively.
 
-## Pipeline (off-chain, keepers in `solana-vrf-avs`)
-1. `finalize()` settles the auction (permissionless).
-2. `sendToWarp` releases winning PNDC → WARP wrapper `0x4e81…225f8` → **wPOND**.
-3. wPOND → deBridge DLN `0xeF4f…EB66` → Solana receiver `AYg4…53opT`.
-4. Forward `AYg4…53opT` → functionwallet `1orF…iWWL` → single-side wPOND pool.
+## Warping and liquidity
 
-Verified on-chain: PNDC `0x423f4e6138E475D85CF7Ea071AC92097Ed631eea` (18 dec) ·
-wPOND "POND COIN - WARPED" `0x4e810ad33733bef360b12eb59c98c1d5d3a225f8` (18 dec).
+1. Settle the round and release winning PNDC to its pinned Ethereum custodian.
+2. A reviewed authorized solver wraps PNDC using `0x4E810aD33733BEF360B12eB59C98c1D5D3A225F8`.
+3. AVS creates a deBridge order for Solana wPOND with the fixed Gigaswap receiver `1orFCnFfgwPzSgUaoK6Wr3MjgXZ7mtk8NGz9Hh4iWWL`.
+4. Only a finalized positive destination token credit becomes a spendable LP lot. A source bridge receipt alone is insufficient.
+5. The lot may enter a dedicated protocol PoolVault position. The winner receives fee rights, not the wPOND or position ownership.
 
-## Testing — Foundry
-```bash
-forge install foundry-rs/forge-std   # first time
-forge test                            # unit + fuzz + invariants
-forge test -vvv                       # verbose
-```
-- `test/LiquidityMiningAuction.t.sol` — unit + fuzz (min-bid boundary, exact
-  refunds), access control, and a reentrant-token attack against the guard.
-- `test/AuctionInvariant.t.sol` — invariants under fuzzed deposit/exit/finalize/warp:
-  **solvency** (contract balance == escrowed) and the **1T floor** for active bidders.
+PNDC `0x423f4e6138E475D85CF7Ea071AC92097Ed631eea` has 18 decimals; the Ethereum wPOND wrapper has **3 decimals**. Raw PNDC amounts divide exactly by `10^15` when wrapped. Solana wPOND is `3JgFwoYV74f6LwWjQWnr3YDPFnmBdwQfNyubv99jqUoq`. Wrapper source, backing, solver permissions and executable cross-chain routes require review before activation. `sendToWarp` itself only transfers PNDC; it does not wrap or bridge.
 
-> `LiquidVault-alpha.sol` and `tests/`, `simulators/` are earlier drafts, kept for
-> reference and not part of the Foundry build.
+## Deployment and validation
+
+See [INTEGRATION.md](INTEGRATION.md) for paused deployment and custody cutover, and Pond's `docs/auction-warp-integration.md` for the full admin/API/worker runbook. The UI is `/mining/bid`; admin controls are under `/ez/deepliquidity`.
+
+Run `forge test` for unit, fuzz and invariant tests and `forge build` to compile the deployment script. The suite covers escrow/fee solvency, tie ordering, expiry locks, repeated claims, exact token movement, reentrancy, delayed ownership, immutable round rights and launch timing. Current validation: 50 passing tests. Independent review and explorer source verification remain deployment requirements.
+
+Earlier drafts under `LiquidVault-alpha.sol`, `tests/` and `simulators/` are reference material outside the configured Foundry build.
